@@ -7,6 +7,6 @@ class MyApp extends StatelessWidget {
   const MyApp({super.key});
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(title: 'AR Ruler', home: const ArrulerScreen());
+    return MaterialApp(title: 'AR Ruler', home: const ARRulerPage());
   }
 }

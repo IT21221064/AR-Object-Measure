@@ -1,17 +1,30 @@
 // lib/ar_ruler_screen.dart
 // Flutter 3.35 / ar_flutter_plugin 0.7.3
+//
+// Full feature set + auto-shape + smart plane normal:
+// - YOLO EventChannel auto mode switching (Sphere/Cylinder/Cone/Cube)
+// - Projection: Smart / Lock to plane / 3D
+// - Plane (re)lock + Reset All
+// - Calibration dialog (scale multiplier)
+// - Ruler, Cone, Cylinder, Sphere, Cube (step-by-step)
+// - Dotted guides + start/end dots
+// - Works on horizontal AND vertical planes.
+//
+// Class name = ARRulerPage
 
+import 'dart:async';
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:vector_math/vector_math_64.dart' as vm;
 
 // AR plugin
 import 'package:ar_flutter_plugin/ar_flutter_plugin.dart';
 import 'package:ar_flutter_plugin/datatypes/config_planedetection.dart';
-import 'package:ar_flutter_plugin/managers/ar_session_manager.dart';
-import 'package:ar_flutter_plugin/managers/ar_object_manager.dart';
 import 'package:ar_flutter_plugin/managers/ar_anchor_manager.dart';
 import 'package:ar_flutter_plugin/managers/ar_location_manager.dart';
+import 'package:ar_flutter_plugin/managers/ar_object_manager.dart';
+import 'package:ar_flutter_plugin/managers/ar_session_manager.dart';
 import 'package:ar_flutter_plugin/models/ar_node.dart';
 import 'package:ar_flutter_plugin/datatypes/node_types.dart';
 
@@ -27,9 +40,19 @@ String _fmtLen(double m) => '${(m * 100).toStringAsFixed(1)} cm';
 String _fmtArea(double m2) => '${(m2 * 1e4).toStringAsFixed(1)} cm²';
 String _fmtVol(double m3) => '${(m3 * 1e6).toStringAsFixed(1)} cm³';
 
-vm.Vector3 _posFromM4(vm.Matrix4 m) => vm.Vector3(m.storage[12], m.storage[13], m.storage[14]);
-// Sceneform/ARCore: Y axis ~ plane normal
-vm.Vector3 _normalFromM4(vm.Matrix4 m) => vm.Vector3(m.storage[4], m.storage[5], m.storage[6]).normalized();
+vm.Vector3 _posFromM4(vm.Matrix4 m) =>
+    vm.Vector3(m.storage[12], m.storage[13], m.storage[14]);
+
+// === SMART PLANE NORMAL ===
+// If local Y is close to world-up → horizontal plane → use Y.
+// Otherwise assume vertical plane → use Z (flip to X if needed for your build).
+vm.Vector3 _normalFromM4Smart(vm.Matrix4 m) {
+  final y = vm.Vector3(m.storage[4], m.storage[5], m.storage[6]); // local up
+  final z = vm.Vector3(m.storage[8], m.storage[9], m.storage[10]);
+  const upCos = 0.7; // ~45°
+  if (y.y.abs() > upCos) return y.normalized(); // floor/table
+  return z.normalized(); // wall/door
+}
 
 vm.Vector3 _projectToPlane(vm.Vector3 p, vm.Vector3 o, vm.Vector3 n) {
   final vm.Vector3 op = p - o;
@@ -45,13 +68,14 @@ enum CylStep { baseCenter, baseEdge, topCenter, done }
 enum SphereStep { p1, p2, done }
 enum CubeStep { edgeStart, edgeEnd, done }
 
-class ArrulerScreen extends StatefulWidget {
-  const ArrulerScreen({super.key});
+class ARRulerPage extends StatefulWidget {
+  const ARRulerPage({super.key});
   @override
-  State<ArrulerScreen> createState() => _ArrulerScreenState();
+  State<ARRulerPage> createState() => _ARRulerPageState();
 }
 
-class _ArrulerScreenState extends State<ArrulerScreen> {
+class _ARRulerPageState extends State<ARRulerPage> {
+  // AR managers
   late ARSessionManager _session;
   late ARObjectManager _objects;
 
@@ -92,12 +116,60 @@ class _ArrulerScreenState extends State<ArrulerScreen> {
   final List<ARNode> _tinyHistory = [];
   final List<ARNode> _ghostDots = [];
 
+  // ===== YOLO auto-shape (EventChannel from Android plugin) =====
+  static const _detectorEvents = EventChannel('ar_detector/events');
+  StreamSubscription? _detectorSub;
+  bool _autoMode = true;
+  String? _lastLabel;
+  int _stableCount = 0;
+  final int _stableThreshold = 8; // ~0.3–0.5s stability at ~15–25fps
+  DateTime _cooldownUntil = DateTime.fromMillisecondsSinceEpoch(0);
+
+  @override
+  void initState() {
+    super.initState();
+    _detectorSub =
+        _detectorEvents.receiveBroadcastStream().listen(_onDetectorEvent);
+  }
+
+  @override
+  void dispose() {
+    _detectorSub?.cancel();
+
+    for (final node in _lineDots) {
+      try {
+        _objects.removeNode(node);
+      } catch (_) {}
+    }
+    if (_dotA != null) {
+      try {
+        _objects.removeNode(_dotA!);
+      } catch (_) {}
+    }
+    if (_dotB != null) {
+      try {
+        _objects.removeNode(_dotB!);
+      } catch (_) {}
+    }
+    _lineDots.clear();
+    _dotA = null;
+    _dotB = null;
+    _session.dispose();
+    super.dispose();
+  }
+
+  // ===== UI =====
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
         title: const Text('AR Measure'),
         actions: [
+          IconButton(
+            tooltip: _autoMode ? 'Auto shape: ON' : 'Auto shape: OFF',
+            icon: Icon(_autoMode ? Icons.auto_mode : Icons.handyman),
+            onPressed: () => setState(() => _autoMode = !_autoMode),
+          ),
           IconButton(
             tooltip: 'Calibrate scale',
             icon: const Icon(Icons.tune),
@@ -108,10 +180,12 @@ class _ArrulerScreenState extends State<ArrulerScreen> {
             onSelected: _handleProjectionMenu,
             itemBuilder: (_) => const [
               PopupMenuItem(value: 'smart', child: Text('Projection: Smart')),
-              PopupMenuItem(value: 'plane', child: Text('Projection: Lock to plane')),
+              PopupMenuItem(
+                  value: 'plane', child: Text('Projection: Lock to plane')),
               PopupMenuItem(value: '3d', child: Text('Projection: 3D')),
               PopupMenuDivider(),
-              PopupMenuItem(value: 'relock', child: Text('Relock plane on next tap')),
+              PopupMenuItem(
+                  value: 'relock', child: Text('Relock plane on next tap')),
               PopupMenuItem(value: 'reset', child: Text('Reset all')),
             ],
           ),
@@ -119,7 +193,8 @@ class _ArrulerScreenState extends State<ArrulerScreen> {
       ),
       body: Stack(children: [
         ARView(
-          onARViewCreated: _onARViewCreated,
+          onARViewCreated:
+          _onARViewCreated, // 4-arg callback (plugin 0.7.3 signature)
           planeDetectionConfig: PlaneDetectionConfig.horizontalAndVertical,
         ),
         Positioned(left: 12, right: 12, bottom: 18, child: _hud()),
@@ -136,43 +211,48 @@ class _ArrulerScreenState extends State<ArrulerScreen> {
     String main;
     switch (_mode) {
       case ShapeMode.ruler:
-        if (_pA == null) main = 'Tap START';
-        else if (_pB == null) main = 'Tap END';
-        else main = _liveCm == null ? '...' : '${_liveCm!.toStringAsFixed(1)} cm';
+        if (_pA == null) {
+          main = 'Tap START';
+        } else if (_pB == null) {
+          main = 'Tap END';
+        } else {
+          main = _liveCm == null ? '...' : '${_liveCm!.toStringAsFixed(1)} cm';
+        }
         break;
       case ShapeMode.cone:
         main = switch (_coneStep) {
           ConeStep.baseCenter => 'Cone: tap BASE CENTER',
-          ConeStep.baseEdge   => 'Cone: tap a BASE EDGE point (radius)',
-          ConeStep.apex       => 'Cone: tap APEX (tip)',
-          ConeStep.done       => 'Cone: tap to start new',
+          ConeStep.baseEdge => 'Cone: tap a BASE EDGE point (radius)',
+          ConeStep.apex => 'Cone: tap APEX (tip)',
+          ConeStep.done => 'Cone: tap to start new',
         };
         break;
       case ShapeMode.cylinder:
         main = switch (_cylStep) {
           CylStep.baseCenter => 'Cylinder: tap BASE CENTER',
-          CylStep.baseEdge   => 'Cylinder: tap BASE EDGE (radius)',
-          CylStep.topCenter  => 'Cylinder: tap TOP CENTER',
-          CylStep.done       => 'Cylinder: tap to start new',
+          CylStep.baseEdge => 'Cylinder: tap BASE EDGE (radius)',
+          CylStep.topCenter => 'Cylinder: tap TOP CENTER',
+          CylStep.done => 'Cylinder: tap to start new',
         };
         break;
       case ShapeMode.sphere:
         main = switch (_sphereStep) {
-          SphereStep.p1  => 'Sphere: tap point on surface',
-          SphereStep.p2  => 'Sphere: tap opposite point (diameter)',
-          SphereStep.done=> 'Sphere: tap to start new',
+          SphereStep.p1 => 'Sphere: tap point on surface',
+          SphereStep.p2 => 'Sphere: tap opposite point (diameter)',
+          SphereStep.done => 'Sphere: tap to start new',
         };
         break;
       case ShapeMode.cube:
         main = switch (_cubeStep) {
           CubeStep.edgeStart => 'Cube: tap EDGE START',
-          CubeStep.edgeEnd   => 'Cube: tap EDGE END',
-          CubeStep.done      => 'Cube: tap to start new',
+          CubeStep.edgeEnd => 'Cube: tap EDGE END',
+          CubeStep.done => 'Cube: tap to start new',
         };
         break;
     }
 
-    final planeStr = (_planeO != null) ? 'Plane: locked' : 'Plane: (locks on 1st tap)';
+    final planeStr =
+    (_planeO != null) ? 'Plane: locked' : 'Plane: (locks on 1st tap)';
     final projStr = switch (_proj) {
       ProjectionMode.smart => 'Smart',
       ProjectionMode.lockToPlane => 'Lock',
@@ -181,7 +261,8 @@ class _ArrulerScreenState extends State<ArrulerScreen> {
 
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-      decoration: BoxDecoration(color: Colors.black87, borderRadius: BorderRadius.circular(12)),
+      decoration: BoxDecoration(
+          color: Colors.black87, borderRadius: BorderRadius.circular(12)),
       child: DefaultTextStyle(
         style: const TextStyle(color: Colors.white),
         child: Column(mainAxisSize: MainAxisSize.min, children: [
@@ -213,34 +294,58 @@ class _ArrulerScreenState extends State<ArrulerScreen> {
     await _objects.onInitialize();
 
     _session.onPlaneOrPointTap = (hits) async {
+      if (!mounted) return;
       if (hits.isEmpty) return;
+
       final m = hits.first.worldTransform;
       final p = _posFromM4(m);
-      final n = _normalFromM4(m);
+      final n = _normalFromM4Smart(m); // smart normal (walls & floors)
 
-      // lock plane from first tap (or after "relock")
-      _planeO ??= p;
-      _planeN ??= n;
+      // lock plane from first tap, or re-lock if tilt differs a lot
+      if (_planeO == null || _planeN == null) {
+        _planeO = p;
+        _planeN = n;
+      } else if (_tiltChanged(_planeN!, n)) {
+        _planeO = p;
+        _planeN = n;
+        _toast('Plane re-locked for this surface');
+      }
 
       switch (_mode) {
-        case ShapeMode.ruler:    await _tapRuler(p);    break;
-        case ShapeMode.cone:     await _tapCone(p);     break;
-        case ShapeMode.cylinder: await _tapCylinder(p); break;
-        case ShapeMode.sphere:   await _tapSphere(p);   break;
-        case ShapeMode.cube:     await _tapCube(p);     break;
+        case ShapeMode.ruler:
+          await _tapRuler(p);
+          break;
+        case ShapeMode.cone:
+          await _tapCone(p);
+          break;
+        case ShapeMode.cylinder:
+          await _tapCylinder(p);
+          break;
+        case ShapeMode.sphere:
+          await _tapSphere(p);
+          break;
+        case ShapeMode.cube:
+          await _tapCube(p);
+          break;
       }
-      setState(() {});
+      if (mounted) setState(() {});
     };
+  }
+
+  bool _tiltChanged(vm.Vector3 a, vm.Vector3 b, {double deg = 30}) {
+    final dot = a.dot(b).clamp(-1.0, 1.0);
+    final angle = vm.degrees(math.acos(dot));
+    return angle > deg;
   }
 
   // --------------------------- projection & distance ---------------------------
   bool _nearLockedPlane(vm.Vector3 p, {double eps = 0.02}) {
     if (_planeO == null || _planeN == null) return false;
     return ((p - _planeO!).dot(_planeN!).abs() <= eps);
+    // eps ≈ 2 cm tolerance from plane
   }
 
   double _distanceSmart(vm.Vector3 a, vm.Vector3 b) {
-    // meters before scale
     final d3 = _dist3(a, b);
     if (_proj == ProjectionMode.off3D) return d3 * _scale;
 
@@ -249,18 +354,16 @@ class _ArrulerScreenState extends State<ArrulerScreen> {
       final bp = _projectToPlane(b, _planeO!, _planeN!);
       final dp = _dist3(ap, bp);
       if (_proj == ProjectionMode.lockToPlane) return dp * _scale;
-
-      // smart: if both points lie "near" the plane, prefer planar dist
       if (_nearLockedPlane(a) && _nearLockedPlane(b)) return dp * _scale;
     }
     return d3 * _scale;
   }
 
-  // orthogonal height to locked plane (for cylinder/cone)
+  // orthogonal height to locked plane (for cylinder/cone) — works on walls & floors
   double _heightToLockedPlane(vm.Vector3 baseCenter, vm.Vector3 topCenter) {
     if (_planeN == null) return _dist3(baseCenter, topCenter) * _scale;
     final diff = topCenter - baseCenter;
-    final h = diff.dot(_planeN!).abs(); // true perpendicular height
+    final h = diff.dot(_planeN!).abs(); // perpendicular (true) height
     return h * _scale;
   }
 
@@ -296,16 +399,18 @@ class _ArrulerScreenState extends State<ArrulerScreen> {
       case ConeStep.baseEdge:
         _coneBaseEdge = p;
         await _placeTiny(p);
-        // show radius line on plane
-        await _drawDottedBetween(_projectToPlane(_coneBaseC!, _planeO!, _planeN!),
-            _projectToPlane(_coneBaseEdge!, _planeO!, _planeN!));
+        // planar radius
+        await _drawDottedBetween(
+          _projectToPlane(_coneBaseC!, _planeO!, _planeN!),
+          _projectToPlane(_coneBaseEdge!, _planeO!, _planeN!),
+        );
         _coneStep = ConeStep.apex;
         break;
 
       case ConeStep.apex:
         _coneApex = p;
         await _placeTiny(p);
-        // show height guide
+        // height guide (perpendicular)
         await _drawDottedBetween(_coneBaseC!, _coneApex!);
         _computeCone();
         _coneStep = ConeStep.done;
@@ -320,13 +425,14 @@ class _ArrulerScreenState extends State<ArrulerScreen> {
   }
 
   void _computeCone() {
-    // radius measured on base plane, height orthogonal to base plane
     final vm.Vector3 baseC = _coneBaseC!;
     final vm.Vector3 baseR = _coneBaseEdge!;
-    final vm.Vector3 apex  = _coneApex!;
+    final vm.Vector3 apex = _coneApex!;
     final vm.Vector3 o = _planeO!, n = _planeN!;
 
-    final r = _dist3(_projectToPlane(baseC, o, n), _projectToPlane(baseR, o, n)) * _scale;
+    final r = _dist3(_projectToPlane(baseC, o, n),
+        _projectToPlane(baseR, o, n)) *
+        _scale;
     final h = _heightToLockedPlane(baseC, apex);
     final s = math.sqrt(r * r + h * h);
     final vol = (math.pi * r * r * h) / 3.0;
@@ -354,10 +460,11 @@ class _ArrulerScreenState extends State<ArrulerScreen> {
       case CylStep.baseEdge:
         _cylBaseEdge = p;
         await _placeTiny(p);
-        // visualize planar radius
-        final a = _projectToPlane(_cylBaseC!, _planeO!, _planeN!);
-        final b = _projectToPlane(_cylBaseEdge!, _planeO!, _planeN!);
-        await _drawDottedBetween(a, b);
+        // planar radius
+        await _drawDottedBetween(
+          _projectToPlane(_cylBaseC!, _planeO!, _planeN!),
+          _projectToPlane(_cylBaseEdge!, _planeO!, _planeN!),
+        );
         _cylStep = CylStep.topCenter;
         break;
 
@@ -368,7 +475,8 @@ class _ArrulerScreenState extends State<ArrulerScreen> {
         final r = _dist3(
           _projectToPlane(_cylBaseC!, _planeO!, _planeN!),
           _projectToPlane(_cylBaseEdge!, _planeO!, _planeN!),
-        ) * _scale;
+        ) *
+            _scale;
 
         final h = _heightToLockedPlane(_cylBaseC!, _cylTopC!);
 
@@ -469,7 +577,11 @@ class _ArrulerScreenState extends State<ArrulerScreen> {
     required vm.Vector3 at,
     double size = 0.01,
   }) async {
-    final node = ARNode(type: NodeType.webGLB, uri: _dotGlb, position: at, scale: vm.Vector3.all(size));
+    final node = ARNode(
+        type: NodeType.webGLB,
+        uri: _dotGlb,
+        position: at,
+        scale: vm.Vector3.all(size));
     if (isA && _dotA != null) await _safeRemove(_dotA!);
     if (!isA && _dotB != null) await _safeRemove(_dotB!);
     await _objects.addNode(node);
@@ -481,7 +593,11 @@ class _ArrulerScreenState extends State<ArrulerScreen> {
   }
 
   Future<void> _placeTiny(vm.Vector3 at) async {
-    final node = ARNode(type: NodeType.webGLB, uri: _dotGlb, position: at, scale: vm.Vector3.all(0.008));
+    final node = ARNode(
+        type: NodeType.webGLB,
+        uri: _dotGlb,
+        position: at,
+        scale: vm.Vector3.all(0.008));
     await _objects.addNode(node);
     _lineDots.add(node);
     _tinyHistory.add(node);
@@ -525,23 +641,36 @@ class _ArrulerScreenState extends State<ArrulerScreen> {
     }
     _ghostDots.clear();
 
-    if (_dotA != null) { await _safeRemove(_dotA!); _dotA = null; }
-    if (_dotB != null) { await _safeRemove(_dotB!); _dotB = null; }
+    if (_dotA != null) {
+      await _safeRemove(_dotA!);
+      _dotA = null;
+    }
+    if (_dotB != null) {
+      await _safeRemove(_dotB!);
+      _dotB = null;
+    }
 
-    _pA = null; _pB = null; _liveCm = null;
+    _pA = null;
+    _pB = null;
+    _liveCm = null;
   }
 
   Future<void> _resetAll() async {
     await _resetMeasureVisuals();
-    _planeO = null; _planeN = null;
+    _planeO = null;
+    _planeN = null;
     _scale = 1.0;
 
-    _coneStep = ConeStep.baseCenter; _coneBaseC = _coneBaseEdge = _coneApex = null;
-    _cylStep  = CylStep.baseCenter;  _cylBaseC  = _cylBaseEdge  = _cylTopC   = null;
-    _sphereStep = SphereStep.p1;     _sP1 = _sP2 = null;
-    _cubeStep = CubeStep.edgeStart;  _cubeA = _cubeB = null;
+    _coneStep = ConeStep.baseCenter;
+    _coneBaseC = _coneBaseEdge = _coneApex = null;
+    _cylStep = CylStep.baseCenter;
+    _cylBaseC = _cylBaseEdge = _cylTopC = null;
+    _sphereStep = SphereStep.p1;
+    _sP1 = _sP2 = null;
+    _cubeStep = CubeStep.edgeStart;
+    _cubeA = _cubeB = null;
 
-    setState(() {});
+    if (mounted) setState(() {});
   }
 
   // --------------------------- menus & dialogs ---------------------------
@@ -550,17 +679,27 @@ class _ArrulerScreenState extends State<ArrulerScreen> {
       context: context,
       builder: (_) => SafeArea(
         child: Column(mainAxisSize: MainAxisSize.min, children: [
-          ListTile(leading: const Icon(Icons.straighten), title: const Text('Ruler (2-tap)'),
-              onTap: ()=>Navigator.pop(context, ShapeMode.ruler)),
+          ListTile(
+              leading: const Icon(Icons.straighten),
+              title: const Text('Ruler (2-tap)'),
+              onTap: () => Navigator.pop(context, ShapeMode.ruler)),
           const Divider(height: 1),
-          ListTile(leading: const Icon(Icons.icecream), title: const Text('Cone'),
-              onTap: ()=>Navigator.pop(context, ShapeMode.cone)),
-          ListTile(leading: const Icon(Icons.view_week), title: const Text('Cylinder'),
-              onTap: ()=>Navigator.pop(context, ShapeMode.cylinder)),
-          ListTile(leading: const Icon(Icons.circle_outlined), title: const Text('Sphere'),
-              onTap: ()=>Navigator.pop(context, ShapeMode.sphere)),
-          ListTile(leading: const Icon(Icons.all_inbox), title: const Text('Cube'),
-              onTap: ()=>Navigator.pop(context, ShapeMode.cube)),
+          ListTile(
+              leading: const Icon(Icons.icecream),
+              title: const Text('Cone'),
+              onTap: () => Navigator.pop(context, ShapeMode.cone)),
+          ListTile(
+              leading: const Icon(Icons.view_week),
+              title: const Text('Cylinder'),
+              onTap: () => Navigator.pop(context, ShapeMode.cylinder)),
+          ListTile(
+              leading: const Icon(Icons.circle_outlined),
+              title: const Text('Sphere'),
+              onTap: () => Navigator.pop(context, ShapeMode.sphere)),
+          ListTile(
+              leading: const Icon(Icons.all_inbox),
+              title: const Text('Cube'),
+              onTap: () => Navigator.pop(context, ShapeMode.cube)),
           const SizedBox(height: 6),
         ]),
       ),
@@ -571,26 +710,42 @@ class _ArrulerScreenState extends State<ArrulerScreen> {
     setState(() => _mode = sel);
 
     switch (_mode) {
-      case ShapeMode.ruler: _toast('Ruler: tap START then END'); break;
-      case ShapeMode.cone: _toast('Cone: tap BASE CENTER'); break;
-      case ShapeMode.cylinder: _toast('Cylinder: tap BASE CENTER'); break;
-      case ShapeMode.sphere: _toast('Sphere: tap first point'); break;
-      case ShapeMode.cube: _toast('Cube: tap EDGE START'); break;
+      case ShapeMode.ruler:
+        _toast('Ruler: tap START then END');
+        break;
+      case ShapeMode.cone:
+        _toast('Cone: tap BASE CENTER');
+        break;
+      case ShapeMode.cylinder:
+        _toast('Cylinder: tap BASE CENTER');
+        break;
+      case ShapeMode.sphere:
+        _toast('Sphere: tap first point');
+        break;
+      case ShapeMode.cube:
+        _toast('Cube: tap EDGE START');
+        break;
     }
   }
 
   void _showResult(String title, List<String> lines) {
-    showDialog(context: context, builder: (_) {
-      return AlertDialog(
-        title: Text(title),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: lines.map(Text.new).toList(),
-        ),
-        actions: [TextButton(onPressed: ()=>Navigator.pop(context), child: const Text('OK'))],
-      );
-    });
+    showDialog(
+        context: context,
+        builder: (_) {
+          return AlertDialog(
+            title: Text(title),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: lines.map(Text.new).toList(),
+            ),
+            actions: [
+              TextButton(
+                  onPressed: () => Navigator.pop(context),
+                  child: const Text('OK'))
+            ],
+          );
+        });
   }
 
   // --------------------------- calibration ---------------------------
@@ -598,13 +753,31 @@ class _ArrulerScreenState extends State<ArrulerScreen> {
     // Choose the most recent 2 points relevant to the mode
     vm.Vector3? a, b;
     switch (_mode) {
-      case ShapeMode.ruler: a = _pA; b = _pB; break;
-      case ShapeMode.cone: a = _coneBaseC; b = _coneBaseEdge; break;
-      case ShapeMode.cylinder: a = _cylBaseC; b = _cylBaseEdge; break;
-      case ShapeMode.sphere: a = _sP1; b = _sP2; break;
-      case ShapeMode.cube: a = _cubeA; b = _cubeB; break;
+      case ShapeMode.ruler:
+        a = _pA;
+        b = _pB;
+        break;
+      case ShapeMode.cone:
+        a = _coneBaseC;
+        b = _coneBaseEdge;
+        break;
+      case ShapeMode.cylinder:
+        a = _cylBaseC;
+        b = _cylBaseEdge;
+        break;
+      case ShapeMode.sphere:
+        a = _sP1;
+        b = _sP2;
+        break;
+      case ShapeMode.cube:
+        a = _cubeA;
+        b = _cubeB;
+        break;
     }
-    if (a == null || b == null) { _toast('Make a measurement first.'); return; }
+    if (a == null || b == null) {
+      _toast('Make a measurement first.');
+      return;
+    }
 
     final currentM = _distanceSmart(a, b); // already scaled
     final currentCm = currentM * 100.0;
@@ -615,17 +788,25 @@ class _ArrulerScreenState extends State<ArrulerScreen> {
       builder: (_) => AlertDialog(
         title: const Text('Calibrate scale'),
         content: Column(mainAxisSize: MainAxisSize.min, children: [
-          const Text('Enter the REAL distance (cm) between the last two points.'),
+          const Text(
+              'Enter the REAL distance (cm) between the last two points.'),
           const SizedBox(height: 8),
-          TextField(controller: ctrl, keyboardType: const TextInputType.numberWithOptions(decimal: true)),
+          TextField(
+              controller: ctrl,
+              keyboardType:
+              const TextInputType.numberWithOptions(decimal: true)),
           const SizedBox(height: 6),
           Text('Measured now: ${currentCm.toStringAsFixed(1)} cm'),
         ]),
         actions: [
-          TextButton(onPressed: ()=>Navigator.pop(context), child: const Text('Cancel')),
-          ElevatedButton(onPressed: (){
-            Navigator.pop(context, double.tryParse(ctrl.text.trim()));
-          }, child: const Text('Apply')),
+          TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Cancel')),
+          ElevatedButton(
+              onPressed: () {
+                Navigator.pop(context, double.tryParse(ctrl.text.trim()));
+              },
+              child: const Text('Apply')),
         ],
       ),
     );
@@ -633,25 +814,99 @@ class _ArrulerScreenState extends State<ArrulerScreen> {
     if (realCm == null || realCm <= 0) return;
     final realM = realCm / 100.0;
     final safe = currentM <= 1e-6 ? 1e-6 : currentM;
-    setState(()=> _scale *= (realM / safe));
+    setState(() => _scale *= (realM / safe));
     _toast('Scale set to x${_scale.toStringAsFixed(3)}');
   }
 
   // --------------------------- utilities ---------------------------
   void _handleProjectionMenu(String s) async {
     switch (s) {
-      case 'smart': setState(()=>_proj = ProjectionMode.smart); _toast('Projection: Smart'); break;
-      case 'plane': setState(()=>_proj = ProjectionMode.lockToPlane); _toast('Projection: Lock'); break;
-      case '3d': setState(()=>_proj = ProjectionMode.off3D); _toast('Projection: 3D'); break;
-      case 'relock': _planeO = null; _planeN = null; _toast('Plane relock on next tap'); break;
-      case 'reset': await _resetAll(); _toast('Reset'); break;
+      case 'smart':
+        setState(() => _proj = ProjectionMode.smart);
+        _toast('Projection: Smart');
+        break;
+      case 'plane':
+        setState(() => _proj = ProjectionMode.lockToPlane);
+        _toast('Projection: Lock');
+        break;
+      case '3d':
+        setState(() => _proj = ProjectionMode.off3D);
+        _toast('Projection: 3D');
+        break;
+      case 'relock':
+        _planeO = null;
+        _planeN = null;
+        _toast('Plane relock on next tap');
+        break;
+      case 'reset':
+        await _resetAll();
+        _toast('Reset');
+        break;
     }
   }
 
   Future<void> _safeRemove(ARNode node) async {
-    try { await _objects.removeNode(node); } catch (_) {}
+    try {
+      await _objects.removeNode(node);
+    } catch (_) {}
   }
 
   void _toast(String s) =>
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(s)));
+
+  // ===== YOLO event handling =====
+  void _onDetectorEvent(dynamic event) {
+    if (!_autoMode) return;
+    if (DateTime.now().isBefore(_cooldownUntil)) return;
+
+    final map = (event as Map).cast<String, dynamic>();
+    final label = (map['label'] as String? ?? '').toLowerCase();
+    final conf = (map['conf'] as num?)?.toDouble() ?? 0.0;
+
+    if (conf < 0.60) {
+      _stableCount = 0;
+      _lastLabel = null;
+      return;
+    }
+
+    if (_lastLabel == label) {
+      _stableCount++;
+    } else {
+      _lastLabel = label;
+      _stableCount = 1;
+    }
+
+    if (_stableCount >= _stableThreshold) {
+      final inferred = _shapeFromLabel(label);
+      if (inferred != null && inferred != _mode) {
+        setState(() => _mode = inferred);
+        _toast('Detected: ${_mode.name.toUpperCase()}');
+        _cooldownUntil = DateTime.now().add(const Duration(seconds: 1));
+      }
+      _stableCount = 0;
+    }
+  }
+
+  ShapeMode? _shapeFromLabel(String l) {
+    // COCO-ish heuristics -> measurement modes
+    if (l.contains('sports ball') || l.contains('tennis ball') || l == 'ball') {
+      return ShapeMode.sphere;
+    }
+    if (l.contains('bottle') ||
+        l.contains('cup') ||
+        l.contains('wine glass') ||
+        l.contains('can')) {
+      return ShapeMode.cylinder;
+    }
+    if (l.contains('traffic cone') || l == 'cone') {
+      return ShapeMode.cone; // only if your model includes it
+    }
+    if (l.contains('box') ||
+        l.contains('carton') ||
+        l.contains('package') ||
+        l.contains('book')) {
+      return ShapeMode.cube;
+    }
+    return null; // otherwise keep current mode (ruler)
+  }
 }
