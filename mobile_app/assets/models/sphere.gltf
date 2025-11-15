@@ -1,0 +1,107 @@
+{
+  "scene": 0,
+  "scenes": [
+    {
+      "nodes": [
+        0
+      ]
+    }
+  ],
+  "asset": {
+    "version": "2.0",
+    "generator": "https://github.com/mikedh/trimesh"
+  },
+  "accessors": [
+    {
+      "componentType": 5125,
+      "type": "SCALAR",
+      "bufferView": 0,
+      "count": 3840,
+      "max": [
+        641
+      ],
+      "min": [
+        0
+      ],
+      "byteOffset": 0
+    },
+    {
+      "componentType": 5126,
+      "type": "VEC3",
+      "byteOffset": 0,
+      "bufferView": 1,
+      "count": 642,
+      "max": [
+        1,
+        1,
+        1
+      ],
+      "min": [
+        -1,
+        -1,
+        -1
+      ]
+    }
+  ],
+  "meshes": [
+    {
+      "name": "geometry_0",
+      "primitives": [
+        {
+          "attributes": {
+            "POSITION": 1
+          },
+          "indices": 0,
+          "mode": 4,
+          "material": 0
+        }
+      ]
+    }
+  ],
+  "nodes": [
+    {
+      "name": "world",
+      "children": [
+        1
+      ]
+    },
+    {
+      "name": "geometry_0",
+      "mesh": 0
+    }
+  ],
+  "buffers": [
+    {
+      "name": "sphere",
+      "byteLength": 23064,
+      "uri": "sphere.bin"
+    }
+  ],
+  "bufferViews": [
+    {
+      "buffer": 0,
+      "byteOffset": 0,
+      "byteLength": 15360,
+      "target": 34963
+    },
+    {
+      "buffer": 0,
+      "byteOffset": 15360,
+      "byteLength": 7704,
+      "byteStride": 12,
+      "target": 34962
+    }
+  ],
+  "materials": [
+    {
+      "name": "default",
+      "emissiveFactor": [
+        0,
+        0,
+        0
+      ],
+      "alphaMode": "OPAQUE",
+      "doubleSided": false
+    }
+  ]
+}
